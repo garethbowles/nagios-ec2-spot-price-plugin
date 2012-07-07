@@ -5,4 +5,4 @@ Checks the current spot price for a given Amazon EC2 instance type and generates
 
 Written in Python; requires the Amazon EC2 command line tools.
 
-![Screenshot](./screenshot.jpg "Screenshot")
+<img src="./screenshot.jpg"/>
