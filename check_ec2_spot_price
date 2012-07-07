@@ -1,0 +1,475 @@
+#!/usr/bin/env python
+#
+#   Copyright Gareth Bowles 2010
+#  
+#   Based on the check_svn plugin written by Hari Sekhon
+#
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation; either version 2 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program; if not, write to the Free Software
+#   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+# 
+
+"""Nagios plugin to check the current EC2 instance spot price. Requires
+   the Amazon EC2 command line tools to be installed somewhere in the path"""
+
+# Standard Nagios return codes
+OK       = 0
+WARNING  = 1
+CRITICAL = 2
+UNKNOWN  = 3
+
+import datetime
+import os
+import re
+import sys
+import signal
+import time
+try:
+    from subprocess import Popen, PIPE, STDOUT
+except ImportError:
+    print "UNKNOWN: Failed to import python subprocess module.",
+    print "Perhaps you are using a version of python older than 2.4?"
+    sys.exit(CRITICAL)
+from optparse import OptionParser
+
+__author__      = "Gareth Bowles"
+__title__       = "Nagios Plugin for Amazon EC2 Spot Price"
+__version__     = 0.1
+
+DEFAULT_TIMEOUT = 20
+
+
+def end(status, message):
+    """Prints a message and exits. First arg is the status code
+    Second Arg is the string message"""
+    
+    check_name = "EC2-SPOT-PRICE "
+    if status == OK:
+        print "%sOK: %s" % (check_name, message)
+        sys.exit(OK)
+    elif status == WARNING:
+        print "%sWARNING: %s" % (check_name, message)
+        sys.exit(WARNING)
+    elif status == CRITICAL:
+        print "%sCRITICAL: %s" % (check_name, message)
+        sys.exit(CRITICAL)
+    else:
+        # This one is intentionally different
+        print "UNKNOWN: %s" % message
+        sys.exit(UNKNOWN)
+
+
+class SpotPriceTester:
+    """Holds state for the EC2 spot price check"""
+
+    def __init__(self):
+        """Initializes all variables to their default states"""
+
+        self.warning         = ""
+        self.critical        = ""
+        self.instance_type   = ""
+        self.os_platform     = "Linux/UNIX"
+        self.timeout         = DEFAULT_TIMEOUT
+        self.verbosity       = 0
+        self.BIN             = ""
+
+        try:
+            self.ec2_home        = os.environ["EC2_HOME"]
+        except KeyError:
+            self.vprint(3, "Environment variable EC2_HOME not set, using value passed on command line")
+
+        try:
+            self.ec2_cert        = os.environ["EC2_CERT"]
+        except KeyError:
+            self.vprint(3, "Environment variable EC2_CERT not set, using value passed on command line")
+
+        try:
+            self.ec2_private_key = os.environ["EC2_PRIVATE_KEY"]
+        except KeyError:
+            self.vprint(3, "Environment variable EC2_PRIVATE_KEY not set, using value passed on command line")
+
+        try:
+            self.java_home       = os.environ["JAVA_HOME"]
+        except KeyError:
+            self.vprint(3, "Environment variable JAVA_HOME not set, using value passed on command line")
+
+
+    def validate_variables(self):
+        """Runs through the validation of all test variables
+        Should be called before the main test to perform a sanity check
+        on the environment and settings"""
+
+        self.validate_warning()
+        self.validate_critical()
+        self.validate_instance_type()
+        self.validate_os_platform()
+        self.validate_timeout()
+        self.verify_check_command()        
+
+
+    def validate_warning(self):
+        """Exits with an error if the warning price level 
+        does not conform to expected format"""
+
+        if self.warning == None:
+            end(UNKNOWN, "You must supply a warning value " \
+                       + "See --help for details")
+
+        self.warning = self.warning.strip()
+
+        # Input Validation - 
+        re_warning = re.compile("^\d\.\d+$")
+
+        if not re_warning.match(self.warning):
+            end(UNKNOWN, "Warning value given does not appear to be a valid " \
+                       + "number - use a dollar value e.g. 0.03 for 3 cents")
+    
+
+    def validate_critical(self):
+        """Exits with an error if the critical price level 
+        does not conform to expected format"""
+
+        if self.critical == None:
+            end(UNKNOWN, "You must supply a critical value " \
+                       + "See --help for details")
+
+        self.critical = self.critical.strip()
+
+        # Input Validation - 
+        re_critical = re.compile("^\d\.\d+$")
+
+        if not re_critical.match(self.critical):
+            end(UNKNOWN, "Critical value given does not appear to be a valid " \
+                       + "number - use a dollar value e.g. 0.03 for 3 cents")
+    
+
+    def validate_instance_type(self):
+        """Validates the EC2 instance type"""
+
+        if self.instance_type == None:
+            end(UNKNOWN, "You must supply a valid EC2 instance type " \
+                       + "See --help for details")
+
+        self.instance_type = self.instance_type.strip()
+        re_instance_type = re.compile("^[cmt][12]\.\w+$")
+        
+        if not re_instance_type.match(self.instance_type):
+            end(UNKNOWN, "You must supply a valid EC2 instance type " \
+                       + "See --help for details")
+
+
+    def validate_os_platform(self):
+        """Exits with an error if the O/S platform is not valid"""
+       
+        self.os_platform = self.os_platform.strip()
+ 
+        if self.os_platform == None:
+            self.os_platform = "Linux/UNIX"
+
+        if self.os_platform != "Linux/UNIX":
+            if self.os_platform != "Windows":
+                end(UNKNOWN, "O/S platform must be \"Linux/UNIX\" or \"Windows\"")
+
+
+    def validate_timeout(self):
+        """Exits with an error if the timeout is not valid"""
+
+        if self.timeout == None:
+            self.timeout = DEFAULT_TIMEOUT
+        try:           
+            self.timeout = int(self.timeout)
+            if not 1 <= self.timeout <= 65535:
+                end(UNKNOWN, "timeout must be between 1 and 3600 seconds")
+        except ValueError:
+            end(UNKNOWN, "timeout number must be a whole number between " \
+                       + "1 and 3600 seconds")
+
+        if self.verbosity == None:
+            self.verbosity = 0
+        
+
+    def verify_check_command(self):
+        """ Ensures the ec2-describe-spot-price-history command exists and is executable """
+      
+        check_command = self.ec2_home + "/bin/ec2-describe-spot-price-history"
+        
+        self.vprint(3, "verify_check_command: Check command is " + check_command)
+
+        self.BIN = self.check_executable(check_command)
+        if not self.BIN:
+            end(UNKNOWN, "The EC2 command 'ec2-describe-spot-price-history' cannot be found in your path. Please check that " \
+               + " you have the Amazon EC2 command line tools installed and that the EC2 environment variables are set " \
+               + "correctly (see http://docs.amazonwebservices.com/AWSEC2/latest/CommandLineReference/) ") 
+
+
+    # Pythonic version of "which"
+    # 
+    def check_executable(self, file):
+        """Takes an executable path as a string and tests if it is executable.
+           Returns the full path of the executable if it is executable, or None if not"""
+
+        self.vprint(3, "check_executable: Check command is " + file)
+        
+        if os.path.isfile(file):
+            self.vprint(3, "check_executable: " + file + " is a file")
+            if os.access(file, os.X_OK):
+                self.vprint(3, "check_executable: " + file + " is executable")
+                return file
+            else:
+                #print >> sys.stderr, "Warning: '%s' in path is not executable"
+                self.vprint(3, "check_executable: " + file + "is not executable" )
+                end(UNKNOWN, "EC2 utility '%s' is not executable" % file)
+
+        self.vprint(3, "check_executable: Check command " + file+ " not found ")
+        return None
+
+
+    def run(self, cmd):
+        """runs a system command and returns a tuple containing 
+        the return code and the output as a single text block"""
+
+        if cmd == "" or cmd == None:
+            end(UNKNOWN, "Internal python error - " \
+                       + "no cmd supplied for run function")
+        
+        self.vprint(3, "running command: %s" % cmd)
+
+        local_env = os.environ.copy()
+        local_env["EC2_HOME"] = self.ec2_home
+        local_env["JAVA_HOME"] = self.java_home
+
+        try:
+            process = Popen( cmd.split(),
+                             bufsize=0,
+                             shell=False, 
+                             stdin=PIPE, 
+                             stdout=PIPE, 
+                             stderr=STDOUT,
+                             env=local_env )
+        except OSError, error:
+            error = str(error)
+            if error == "No such file or directory":
+                end(UNKNOWN, "Cannot find utility '%s'" % cmd.split()[0])
+            else:
+                end(UNKNOWN, "Error trying to run utility '%s' - %s" \
+                                                      % (cmd.split()[0], error))
+
+        stdout, stderr = process.communicate()
+
+        if stderr == None:
+            pass
+
+        if stdout == None or stdout == "":
+            end(UNKNOWN, "No output from utility '%s'" % cmd.split()[0])
+        
+        returncode = process.returncode
+
+        self.vprint(3, "Returncode: '%s'\nOutput: '%s'" % (returncode, stdout))
+        return (returncode, str(stdout))
+
+
+    def set_timeout(self):
+        """Sets an alarm to time out the test"""
+
+        if self.timeout == 1:
+            self.vprint(2, "setting plugin timeout to 1 second")
+        else:
+            self.vprint(2, "setting plugin timeout to %s seconds"\
+                                                                % self.timeout)
+
+        signal.signal(signal.SIGALRM, self.sighandler)
+        signal.alarm(self.timeout)
+
+
+    def sighandler(self, discarded, discarded2):
+        """Function to be called by signal.alarm to kill the plugin"""
+
+        # Nop for these variables
+        discarded = discarded2
+        discarded2 = discarded
+
+        if self.timeout == 1:
+            timeout = "(1 second)"
+        else:
+            timeout = "(%s seconds)" % self.timeout
+
+        end(CRITICAL, "svn plugin has self terminated after exceeding " \
+                    + "the timeout %s" % timeout)
+
+
+    def test_spot_price(self):
+        """Performs the EC2 spot price check"""
+
+        self.validate_variables()
+        self.set_timeout()
+
+        dtstring = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+        cmd = self.BIN + " -K " + self.ec2_private_key + " -C " + self.ec2_cert + " -t " + self.instance_type \
+                  + " -d " + self.os_platform + " -s " + dtstring
+
+        self.vprint(2, "now running EC2 spot price check:\n" + cmd)
+        
+        result, output = self.run(cmd)
+        
+        if result == 0:
+            if len(output) == 0:
+                return (WARNING, "Check passed but no output was received " \
+                               + "from ec2-describe-spot-price-history command, abnormal condition, "  \
+                               + "please check.")
+            else:
+                stripped_output = output.replace("\n", " ").rstrip(" ")
+                price = stripped_output.split()[1]
+                
+                status = OK
+                message = "Current " + self.instance_type + " " + self.os_platform + " spot price is " + price
+
+                if float(price) > float(self.critical):
+                    status = CRITICAL
+                else:
+                    if float(price) > float(self.warning):
+                        status = WARNING
+
+                if self.verbosity >= 1:
+                    return(status, "Got data from ec2-describe-spot-price-history: " + stripped_output)
+                else:
+                    return (status, message)
+        else:
+            if len(output) == 0:
+                return (CRITICAL, "Command failed. " \
+                                + "There was no output from ec2-describe-spot-price-history")
+ 
+
+    def vprint(self, threshold, message):
+        """Prints a message if the first arg is numerically greater than or 
+        equal to the verbosity level"""
+
+        if self.verbosity >= threshold:
+            print "%s" % message
+
+
+def main():
+    """Parses args and calls func to check EC2 spot price"""
+
+    tester = SpotPriceTester()
+    parser = OptionParser()
+    parser.add_option( "-w",
+                       "--warning",
+                       dest="warning",
+                       help="Set status to WARNING if the current EC2 spot price in U.S. dollars is above this value.")
+
+    parser.add_option( "-c",
+                       "--critical",
+                       dest="critical",
+                       help="Set status to CRITICAL if the current EC2 spot price in U.S. dollars is above this value.")
+
+    parser.add_option( "-i",
+                       "--instance-type",
+                       dest="instance_type",
+                       help="EC2 instance type API name (see http://aws.amazon.com/ec2/instance-types/)")
+
+    parser.add_option( "-o",
+                       "--os-platform",
+                       dest="os_platform",
+                       help="O/S platform (allowable values are \"Windows\" or \"Linux/UNIX\": default \"Linux/UNIX\")")
+
+    parser.add_option( "-e",
+                       "--ec2-home",
+                       dest="ec2_home",
+                       help="Path to EC2 command line tools (defaults to environment variable $EC2_HOME)")
+
+    parser.add_option( "-C",
+                       "--ec2-cert",
+                       dest="ec2_cert",
+                       help="Path to EC2 certificate file (defaults to environment variable $EC2_CERT)")
+
+    parser.add_option( "-K",
+                       "--ec2-private-key",
+                       dest="ec2_private_key",
+                       help="Path to EC2 private key file (defaults to environment variable $EC2_PRIVATE_KEY)")
+
+    parser.add_option( "-j",
+                       "--java-home",
+                       dest="java_home",
+                       help="Path to Java installation (defaults to environment variable $JAVA_HOME)")
+
+    parser.add_option( "-t",
+                       "--timeout",
+                       dest="timeout",
+                       help="Sets a timeout after which the the plugin will"   \
+                          + " self terminate. Defaults to %s seconds." \
+                                                              % DEFAULT_TIMEOUT)
+
+    parser.add_option( "-T",
+                       "--timing",
+                       action="store_true",
+                       dest="timing",
+                       help="Enable timer output")
+
+    parser.add_option(  "-v",
+                        "--verbose",
+                        action="count",
+                        dest="verbosity",
+                        help="Verbose mode. Good for testing plugin. By "     \
+                           + "default only one result line is printed as per" \
+                           + " Nagios standards")
+
+    parser.add_option( "-V",
+                        "--version",
+                        action = "store_true",
+                        dest = "version",
+                        help = "Print version number and exit" )
+
+    (options, args) = parser.parse_args()
+
+    if args:
+        parser.print_help()
+        sys.exit(UNKNOWN)
+
+    if options.version:
+        print "%s %s" % (__title__, __version__)
+        sys.exit(UNKNOWN)
+
+    tester.warning         = options.warning
+    tester.critical        = options.critical
+    tester.instance_type   = options.instance_type
+    tester.os_platform     = options.os_platform
+    tester.verbosity       = options.verbosity
+    tester.ec2_home        = options.ec2_home
+    tester.ec2_cert        = options.ec2_cert
+    tester.ec2_private_key = options.ec2_private_key
+    tester.java_home       = options.java_home
+    tester.timeout    = options.timeout
+
+    if options.timing:
+        start_time = time.time()
+
+    returncode, output = tester.test_spot_price()
+
+    if options.timing:
+        finish_time = time.time()
+        total_time = finish_time - start_time
+
+        output += ". Test completed in %.3f seconds" % total_time
+
+    end(returncode, output)
+    sys.exit(UNKNOWN)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print "Caught Control-C..."
+        sys.exit(CRITICAL)
+
